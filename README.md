@@ -3,7 +3,7 @@ Shared task NLPAI4Health
 
 pip install -r requirements.txt
 
-Download the gemma-1b from huggingface and save to local directory
+Download the Qwen2.5-1.5B-Instruct from huggingface and save to local directory
 
 run the fine_tune.py file
 
