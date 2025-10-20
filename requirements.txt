@@ -17,3 +17,4 @@ sacrebleu
 bitsandbytes ==0.43.3
 triton
 soxr 
+langdetect
