@@ -1,357 +1,288 @@
-import os
-import json
+import os, json, time, re
+from pathlib import Path
+from typing import Dict, Any
+from tqdm import tqdm
 import torch
-import sys, importlib, inspect, traceback
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from peft import PeftModel
+from langdetect import detect, DetectorFactory
 
-def accelerate_compat_shim():
-    try:
-        if "accelerate" in sys.modules:
-            accelerate = sys.modules["accelerate"]
-        else:
-            import accelerate
+DetectorFactory.seed = 42
+torch.set_grad_enabled(False)
 
-        ver = getattr(accelerate, "__version__", "unknown")
-        print(f"[shim] accelerate imported from: {getattr(accelerate, '__file__', 'unknown')}")
-        print(f"[shim] accelerate.__version__ = {ver}")
 
-        sig = None
-        try:
-            sig = inspect.signature(accelerate.Accelerator.unwrap_model)
-            print(f"[shim] unwrap_model signature: {sig}")
-        except Exception as e:
-            print("[shim] Could not inspect unwrap_model:", e)
+#SKIP_LANGS = ['Gujarati', 'Dogri', 'Hindi', 'Marathi', 'Kannada', 'English', 'Assamese', 'Tamil', 'Bangla']
 
-        needs_shim = True
-        if sig is not None:
-            if "keep_torch_compile" in list(sig.parameters.keys()):
-                needs_shim = False
-
-        if needs_shim:
-            print("[shim] Applying unwrap_model compatibility patch...")
-            _orig_unwrap = accelerate.Accelerator.unwrap_model
-
-            def _unwrap_compat(self, model, *args, **kwargs):
-                try:
-                    return _orig_unwrap(self, model, *args, **kwargs)
-                except TypeError:
-                    kwargs.pop("keep_torch_compile", None)
-                    return _orig_unwrap(self, model, *args, **kwargs)
-                except Exception:
-                    kwargs.pop("keep_torch_compile", None)
-                    return _orig_unwrap(self, model)
-
-            accelerate.Accelerator.unwrap_model = _unwrap_compat
-            print("[shim] Applied unwrap_model shim.")
-        else:
-            print("[shim] No shim needed.")
-    except Exception as e:
-        print("[shim] ERROR applying accelerate shim:", e)
-        traceback.print_exc()
-
-# run shim before importing transformers/Trainer
-accelerate_compat_shim()
+# -----------------------
+# PATHS
+# -----------------------
+BASE_MODEL   = ""  
+ADAPTER_DIR  = ""
+TEST_DIR     = ""
+OUTPUT_DIR   = ""
 
 # ============================================================
-# IMPORTS
+# RUNTIME SETTINGS
 # ============================================================
-from datasets import Dataset
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    Trainer,
-    TrainingArguments,
-    DataCollatorWithPadding
+MAX_INPUT_TOKENS       = 32000         
+MAX_NEW_TOKENS_SUMMARY = 512
+MAX_NEW_TOKENS_JSON    = 120
+MAX_NEW_TOKENS_QNA     = 200
+BATCH_SIZE             = 2
+
+LANG_HINTS = {
+    "English": "English", "Hindi": "Hindi", "Gujarati": "Gujarati",
+    "Bangla": "Bangla", "Assamese": "Assamese", "Kannada": "Kannada",
+    "Marathi": "Marathi", "Tamil": "Tamil", "Telugu": "Telugu", "Dogri": "Dogri"
+}
+
+# ============================================================
+# PROMPTS
+# ============================================================
+SYSTEM_SUMMARY = (
+    "You are a clinical summarization assistant. Write a fluent English summary "
+    "focusing on diagnosis, symptoms, investigations, and management plan. "
+    "Write 6–10 sentences. End your summary with the token <<END>>."
 )
-from peft import LoraConfig, get_peft_model, PeftModel
-from transformers import BitsAndBytesConfig
 
+SYSTEM_JSON = (
+    "You are a concise clinical information extraction assistant. "
+    "Answer in English only. If the information is not present, answer exactly 'N/A'. "
+    "Do not add explanations. Keep answers ≤ requested length."
+)
+
+SYSTEM_QNA = (
+    "You are a multilingual clinical assistant. Answer in the SAME LANGUAGE as the user's question. "
+    "Be concise, factual, and helpful."
+)
+
+JSON_FIELDS: Dict[str, tuple] = {
+    "patient_identifiers": ("Identify the patient by name or ID if mentioned.", "str", 20, False),
+    "demographics.age": ("What is the patient's age?", "str", 15, False),
+    "demographics.sex": ("What is the patient's sex?", "str", 10, False),
+    "visit.date_time": ("When did the visit occur? (date/time if mentioned)", "str", 20, False),
+    "visit.type": ("What type of visit was it? (in-person/telemedicine etc.)", "str", 16, False),
+    "chief_complaint": ("What is the chief complaint?", "str", 20, False),
+    "onset_duration": ("How long have symptoms been present?", "str", 20, False),
+    "symptom_description": ("Describe main symptoms briefly.", "str", 20, False),
+    "aggravating_factors": ("What aggravates symptoms?", "str", 20, False),
+    "relieving_factors": ("What relieves symptoms?", "str", 20, False),
+    "associated_symptoms": ("List associated symptoms; semicolon-separated.", "list", 40, True),
+    "past_medical_history": ("Summarize past medical history.", "str", 20, False),
+    "past_surgical_history": ("Summarize surgical history.", "str", 16, False),
+    "family_history": ("Summarize family history.", "str", 16, False),
+    "current_medications": ("List current medications; semicolon-separated.", "list", 24, True),
+    "allergies": ("List allergies (or N/A).", "str", 10, False),
+    "social_history": ("Summarize social history (tobacco/alcohol).", "str", 18, False),
+    "functional_status": ("Summarize functional status.", "str", 16, False),
+    "vital_signs": ("List vital signs briefly.", "str", 18, False),
+    "examination_findings": ("Summarize examination findings.", "str", 18, False),
+    "investigations": ("List investigations performed/planned; semicolon-separated.", "list", 30, True),
+    "assessment_primary_diagnosis": ("What is the primary diagnosis?", "str", 14, False),
+    "differential_diagnoses": ("List 2–4 differentials; semicolon-separated.", "list", 16, True),
+    "management_plan": ("Summarize management plan briefly.", "str", 22, False),
+    "tests_referrals_planned": ("List tests/referrals planned; semicolon-separated.", "list", 30, True),
+    "follow_up_plan": ("Summarize follow-up plan.", "str", 16, False),
+    "chronology_response_to_treatment": ("Describe response/progress.", "str", 18, False),
+    "patient_concerns_preferences_consent": ("Summarize patient concerns/consent.", "str", 18, False),
+    "safety_issues_red_flags": ("List red flags briefly.", "str", 18, False),
+    "coding_terms": ("Give likely coding terms or N/A.", "str", 16, False),
+}
 
 # ============================================================
-# CONFIGURATION
+# UTILS
 # ============================================================
-DATA_DIR = ""
-BASE_MODEL = ""
-OUTPUT_DIR = ""
+def tprint(msg): print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-MAX_LEN = 512
-NUM_EPOCHS = 1
-SAVE_STEPS = 1000
-BATCH_SIZE = 1
-GRAD_ACCUM = 16
-LR = 2e-4
-
-
-
-def read_jsonl(path):
-    records = []
-    with open(path, "r", encoding="utf-8") as f:
+def safe_read_jsonl(path: Path):
+    rows = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except Exception:
-                continue
-    return records
+            s = line.strip()
+            if s:
+                try: rows.append(json.loads(s))
+                except: continue
+    return rows
 
+def write_json(path: Path, obj: Any):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
 
-def make_examples(root):
-    examples = []
-    for lang in os.listdir(root):
-        lang_path = os.path.join(root, lang)
-        if not os.path.isdir(lang_path):
+def write_text(path: Path, text: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text.strip() + "\n")
+
+def detect_lang(text: str) -> str:
+    try: return detect(text)
+    except Exception: return "unknown"
+
+def clip_tokens(tokenizer, text, max_tokens):
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(ids) <= max_tokens: return text
+    ids = ids[-max_tokens:]
+    return tokenizer.decode(ids, skip_special_tokens=True)
+
+def shorten(text: str, max_words: int, max_chars: int = 180) -> str:
+    text = re.sub(r"\s+", " ", text.strip())
+    words = text.split()
+    if len(words) > max_words:
+        text = " ".join(words[:max_words])
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip(" .,;:-")
+    return text
+
+def parse_semicolon_list(s: str, max_items: int = 6):
+    if s.strip().upper() == "N/A": return []
+    parts = [p.strip(" ,;.-") for p in s.split(";")]
+    return [p for p in parts if p][:max_items]
+
+# ============================================================
+# CHAT + GENERATION
+# ============================================================
+def build_messages(system_prompt, user_prompt):
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
+def chat_generate(model, tokenizer, messages, max_new_tokens):
+    text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = tokenizer([text], return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=None,
+            top_p=None,
+            num_beams=1,
+            pad_token_id=tokenizer.eos_token_id
+        )
+    gen = outputs[0][len(inputs.input_ids[0]):]
+    return tokenizer.decode(gen, skip_special_tokens=True).strip()
+
+# ============================================================
+# MODEL LOADING
+# ============================================================
+def find_latest_adapter(path):
+    p = Path(path)
+    cands = [d for d in p.iterdir() if d.is_dir() and d.name.startswith("adapter_step_")]
+    return sorted(cands, key=lambda x: int(x.name.split("_")[-1]))[-1] if cands else path
+
+def load_model():
+    tprint("Loading tokenizer...")
+    tok = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
+    tprint("Loading base model...")
+    base = AutoModelForCausalLM.from_pretrained(BASE_MODEL, device_map="auto",
+                                                quantization_config=bnb, torch_dtype=torch.float16)
+    adapter = find_latest_adapter(ADAPTER_DIR)
+    tprint(f"Using adapter: {adapter}")
+    model = PeftModel.from_pretrained(base, adapter)
+    model.eval()
+    return model, tok
+
+# ============================================================
+# MAIN PIPELINE
+# ============================================================
+def main():
+    model, tokenizer = load_model()
+    langs = [p for p in Path(TEST_DIR).iterdir() if p.is_dir()]
+    tprint(f"Found {len(langs)} languages: {[p.name for p in langs]}")
+
+    for lang_dir in langs:
+        lang = lang_dir.name
+        if lang in SKIP_LANGS:
+            tprint(f"Skipping {lang} (already completed or running elsewhere)")
             continue
 
-        dlg_dir = os.path.join(lang_path, "Dialogues")
-        sum_dir = os.path.join(lang_path, "Summary_Text")
-        qna_dir = os.path.join(lang_path, "QnA")
+        lang_hint = LANG_HINTS.get(lang, "the same language")
+        out_lang = Path(OUTPUT_DIR) / lang
+        dlg_dir = lang_dir / "Dialogues"
+        qna_dir = lang_dir / "QnA"
 
-        # --- Summarization ---
-        if os.path.isdir(dlg_dir) and os.path.isdir(sum_dir):
-            for fn in os.listdir(dlg_dir):
-                if not fn.endswith(".jsonl"):
-                    continue
-                dlg_path = os.path.join(dlg_dir, fn)
+        tprint(f"Language: {lang}")
 
-                dialogues = []
-                for x in read_jsonl(dlg_path):
-                    try:
-                        val = x.get("dialogue", "") if isinstance(x, dict) else str(x)
-                        if isinstance(val, list):
-                            val = " ".join(map(str, val))
-                        dialogues.append(str(val))
-                    except Exception:
-                        continue
+        # ---- SUMMARIES + JSON ----
+        if dlg_dir.exists():
+            files = sorted(dlg_dir.glob("*.jsonl"))
+            tprint(f"  • Dialogues: {len(files)}")
+            for f in tqdm(files, desc=f"{lang} dialogues"):
+                out_sum_txt  = out_lang / "Summary_Text" / f"{f.stem}_summary.txt"
+                out_sum_json = out_lang / "Summary_Json" / f"{f.stem}_summary.json"
+                if out_sum_txt.exists() and out_sum_json.exists(): continue
+                rows = safe_read_jsonl(f)
+                dialogue = " ".join(str(r.get("dialogue", "")) if isinstance(r, dict) else str(r) for r in rows)
+                dialogue_clip = clip_tokens(tokenizer, dialogue, MAX_INPUT_TOKENS)
+                messages = build_messages(SYSTEM_SUMMARY, f"Dialogue:\n{dialogue_clip}\n\nWrite the summary and end with <<END>>.")
+                summary_raw = chat_generate(model, tokenizer, messages, MAX_NEW_TOKENS_SUMMARY)
+                end_pos = summary_raw.find("<<END>>")
+                summary = summary_raw[:end_pos].strip() if end_pos != -1 else summary_raw.strip()
+                if detect_lang(summary) != "en":
+                    messages = build_messages(SYSTEM_SUMMARY, f"Dialogue:\n{dialogue_clip}\n\nWrite ONLY in English. End with <<END>>.")
+                    summary_raw = chat_generate(model, tokenizer, messages, MAX_NEW_TOKENS_SUMMARY)
+                    end_pos = summary_raw.find("<<END>>")
+                    summary = summary_raw[:end_pos].strip() if end_pos != -1 else summary_raw.strip()
+                write_text(out_sum_txt, summary)
 
-                dialogue_text = "\n".join(dialogues).strip()
-                if not dialogue_text:
-                    continue
+                flat = {}
+                for field, (q, typ, max_words, is_list) in JSON_FIELDS.items():
+                    user_q = (
+                        f"Summary:\n{summary}\n\nDialogue:\n{dialogue_clip}\n\nQuestion:\n{q}\n\n"
+                        f"Answer in English, ≤{max_words} words. "
+                        f"{'Return a semicolon-separated list.' if is_list else 'Return short phrase.'} "
+                        f"If unknown, answer exactly N/A."
+                    )
+                    msg = build_messages(SYSTEM_JSON, user_q)
+                    ans = chat_generate(model, tokenizer, msg, MAX_NEW_TOKENS_JSON)
+                    if detect_lang(ans) != "en":
+                        msg = build_messages(SYSTEM_JSON, user_q + "\n\nAnswer strictly in English.")
+                        ans = chat_generate(model, tokenizer, msg, MAX_NEW_TOKENS_JSON)
+                    ans = shorten(ans, max_words=max_words, max_chars=180)
+                    flat[field] = parse_semicolon_list(ans) if is_list else ans or "N/A"
 
-                sum_path = os.path.join(sum_dir, fn.replace(".jsonl", "_summary.txt"))
-                if os.path.exists(sum_path):
-                    try:
-                        with open(sum_path, "r", encoding="utf-8") as f:
-                            summary = f.read().strip()
-                        if summary:
-                            prompt = (
-                                f"Summarize the following doctor–patient dialogue in English:\n"
-                                f"{dialogue_text}\nSummary:"
-                            )
-                            examples.append({"text": prompt, "labels": summary})
-                    except Exception:
-                        continue
+                nested = {}
+                for k, v in flat.items():
+                    parts = k.split(".")
+                    cur = nested
+                    for p in parts[:-1]:
+                        cur = cur.setdefault(p, {})
+                    cur[parts[-1]] = v
+                write_json(out_sum_json, nested)
 
-        # --- QnA ---
-        if os.path.isdir(qna_dir):
-            for fn in os.listdir(qna_dir):
-                if not fn.endswith(".json"):
-                    continue
-                try:
-                    with open(os.path.join(qna_dir, fn), "r", encoding="utf-8") as f:
-                        data = json.load(f)
+        # ---- QnA ----
+        if qna_dir.exists():
+            qfiles = sorted(qna_dir.glob("*.json"))
+            tprint(f"  • QnA files: {len(qfiles)}")
+            for qf in tqdm(qfiles, desc=f"{lang} QnA"):
+                try: data = json.load(open(qf, encoding="utf-8"))
                 except Exception:
+                    tprint(f"    - Skipped malformed {qf.name}")
                     continue
-                if not isinstance(data, dict):
-                    continue
-                qs = data.get("questions", [])
-                if not isinstance(qs, list):
-                    continue
-                for qa in qs:
-                    if not isinstance(qa, dict):
-                        continue
-                    q = qa.get("question", "")
-                    a = qa.get("answer", "")
-                    if not q or not a:
-                        continue
-                    prompt = f"Answer the following question in the same language as the dialogue:\nQuestion: {q}\nAnswer:"
-                    examples.append({"text": prompt, "labels": a})
+                qs = [q.get("question","").strip() for q in data.get("questions",[]) if q.get("question","").strip()]
+                if not qs: continue
+                answers = []
+                for q in qs:
+                    msg = build_messages(SYSTEM_QNA, f"Question ({lang_hint}): {q}")
+                    ans = chat_generate(model, tokenizer, msg, MAX_NEW_TOKENS_QNA)
+                    det = detect_lang(ans)
+                    if lang_hint.lower() not in det.lower():
+                        msg = build_messages(SYSTEM_QNA, f"Answer strictly in {lang_hint}:\nQuestion: {q}")
+                        ans = chat_generate(model, tokenizer, msg, MAX_NEW_TOKENS_QNA)
+                    answers.append(ans.strip())
+                out_payload = {"questions":[{"question":q,"answer":a} for q,a in zip(qs,answers)]}
+                write_json(out_lang / "QnA" / f"{qf.stem}_answers.json", out_payload)
 
-    print(f"Loaded {len(examples)} examples from {root}")
-    return examples
+        torch.cuda.empty_cache()
 
-
-# ============================================================
-# LOAD DATA
-# ============================================================
-train_data = make_examples(os.path.join(DATA_DIR, "train"))
-dev_data = make_examples(os.path.join(DATA_DIR, "dev"))
-print(f"Train: {len(train_data)}, Dev: {len(dev_data)}")
+    tprint(f"Inference complete! Results saved to {OUTPUT_DIR}")
 
 
-# ============================================================
-# MODEL + QLORA
-# ============================================================
-bnb_cfg = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16
-)
-
-tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-
-model = AutoModelForCausalLM.from_pretrained(
-    BASE_MODEL,
-    device_map="auto",
-    quantization_config=bnb_cfg
-)
-
-lora_cfg = LoraConfig(
-    r=8,
-    lora_alpha=32,
-    target_modules=["q_proj", "v_proj"],
-    lora_dropout=0.05,
-    task_type="CAUSAL_LM"
-)
-model = get_peft_model(model, lora_cfg)
-model.print_trainable_parameters()
-
-
-def tokenize_fn(examples):
-    prompts = [str(x).strip() for x in examples["text"]]
-    targets = [str(y).strip() for y in examples["labels"]]
-
-    tokenized_prompts = tokenizer(prompts, truncation=True, max_length=256, padding=False)
-    prompt_lens = [len(x) for x in tokenized_prompts["input_ids"]]
-
-    full_texts = [p + " " + t for p, t in zip(prompts, targets)]
-    tokenized_full = tokenizer(full_texts, truncation=True, max_length=MAX_LEN, padding=False)
-
-    input_ids = tokenized_full["input_ids"]
-    attention_mask = tokenized_full["attention_mask"]
-
-    labels = []
-    for i, ids in enumerate(input_ids):
-        l = ids.copy()
-        cutoff = min(prompt_lens[i], len(l))
-        for j in range(cutoff):
-            l[j] = -100
-        labels.append(l)
-
-    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
-
-
-train_ds = Dataset.from_list(train_data).map(tokenize_fn, batched=True, num_proc=4, remove_columns=["text", "labels"])
-dev_ds = Dataset.from_list(dev_data).map(tokenize_fn, batched=True, num_proc=4, remove_columns=["text", "labels"])
-data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True, return_tensors="pt")
-
-
-from transformers import Trainer, TrainingArguments, TrainerCallback
-
-class SavePeftAdapterCallback(TrainerCallback):
-    def __init__(self, out_dir, save_steps=1000):
-        self.out_dir = out_dir
-        self.save_steps = save_steps
-        os.makedirs(out_dir, exist_ok=True)
-
-    def on_step_end(self, args, state, control, **kwargs):
-        if state.global_step % self.save_steps == 0 and state.global_step > 0:
-            model = kwargs.get("model")
-            if hasattr(model, "save_pretrained"):
-                ckpt = os.path.join(self.out_dir, f"adapter_step_{state.global_step}")
-                model.save_pretrained(ckpt)
-                print(f"[callback] Saved adapter checkpoint at step {state.global_step}")
-
-
-args = TrainingArguments(
-    output_dir=OUTPUT_DIR,
-    per_device_train_batch_size=BATCH_SIZE,
-    gradient_accumulation_steps=GRAD_ACCUM,
-    num_train_epochs=NUM_EPOCHS,
-    learning_rate=LR,
-    fp16=True,
-    eval_strategy="epoch",
-    save_strategy="steps",
-    save_steps=SAVE_STEPS,
-    save_total_limit=3,
-    logging_steps=50,
-    report_to="none",
-    dataloader_num_workers=4,
-)
-
-
-
-def find_latest_checkpoint(output_dir):
-    ckpts = [
-        os.path.join(output_dir, d)
-        for d in os.listdir(output_dir)
-        if d.startswith("checkpoint-") and os.path.isdir(os.path.join(output_dir, d)) and not d.endswith("-safe")
-    ]
-    if not ckpts:
-        return None
-    ckpts = sorted(ckpts, key=lambda x: int(x.split("-")[-1]))
-    return ckpts[-1]
-
-
-def convert_checkpoint_to_safetensors(model, src_path, dst_path):
-    os.makedirs(dst_path, exist_ok=True)
-    print(f"Converting checkpoint from {src_path} to {dst_path} (safetensors format)...")
-    model = PeftModel.from_pretrained(model, src_path)
-    model.save_pretrained(dst_path, safe_serialization=True)
-    print(f"Safetensors checkpoint saved at: {dst_path}")
-    return dst_path
-
-
-trainer = Trainer(
-    model=model,
-    args=args,
-    train_dataset=train_ds,
-    eval_dataset=dev_ds,
-    data_collator=data_collator,
-    callbacks=[SavePeftAdapterCallback(OUTPUT_DIR, SAVE_STEPS)]
-)
-
-latest_ckpt = find_latest_checkpoint(OUTPUT_DIR)
-safe_ckpt = None
-
-if latest_ckpt:
-    print(f"Found existing checkpoint: {latest_ckpt}")
-    torch_ver = tuple(map(int, torch.__version__.split(".")[:2]))
-    if torch_ver < (2, 6):
-        safe_ckpt = latest_ckpt + "-safe"
-        if not os.path.exists(safe_ckpt):
-            safe_ckpt = convert_checkpoint_to_safetensors(model, latest_ckpt, safe_ckpt)
-        else:
-            print(f"Using existing safetensors checkpoint: {safe_ckpt}")
-    else:
-        safe_ckpt = latest_ckpt
-else:
-    print("No existing checkpoint found. Starting fresh training run.")
-    safe_ckpt = None
-
-
-
-if safe_ckpt:
-    print(f"Found checkpoint folder: {safe_ckpt}")
-    trainer_state_path = os.path.join(safe_ckpt, "trainer_state.json")
-
-    if os.path.exists(trainer_state_path):
-        # Full Trainer checkpoint (rare in this setup)
-        print("Full checkpoint detected — resuming complete training state...")
-        trainer.train(resume_from_checkpoint=safe_ckpt)
-    else:
-        # Only adapter weights exist
-        print(" No trainer_state.json found — loading adapter weights only.")
-        model = PeftModel.from_pretrained(model, safe_ckpt)
-
-
-        for name, param in model.named_parameters():
-            if "lora" in name:
-                param.requires_grad = True
-        
-                
-        model.train()
-        trainer.model = model
-        model.print_trainable_parameters()
-        print("Continuing training from adapter weights...")
-        trainer.train()
-else:
-    print("Starting fresh training...")
-    trainer.train()
-
-trainer.save_model(OUTPUT_DIR)
-tokenizer.save_pretrained(OUTPUT_DIR)
-print("Training complete! Model saved to:", OUTPUT_DIR)
+if __name__ == "__main__":
+    main()
